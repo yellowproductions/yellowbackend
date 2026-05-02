@@ -1,11 +1,10 @@
 const https = require('https');
-const http = require('http');
 
 const PORT = process.env.PORT || 10000;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const DROPBOX_TOKEN = process.env.DROPBOX_TOKEN;
 
-http.createServer(async (req, res) => {
+require('http').createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -48,33 +47,28 @@ http.createServer(async (req, res) => {
     req.on('data', d => chunks.push(d));
     req.on('end', async () => {
       try {
+        const boundary = req.headers['content-type'].split('boundary=')[1];
         const buffer = Buffer.concat(chunks);
         const bodyStr = buffer.toString('binary');
 
-        // Extract dropboxPath from form data
-        const pathMatch = bodyStr.match(/name="dropboxPath"\r\n\r\n([^\r\n]+)/);
-        const dropboxPath = pathMatch ? pathMatch[1] : '/Jindal/Creatives/upload';
+        // Extract filename and path from headers part
+        const headerEnd = bodyStr.indexOf('\r\n\r\n');
+        const headerPart = bodyStr.substring(0, headerEnd);
+        const filenameMatch = headerPart.match(/filename="([^"]+)"/);
+        const pathMatch = headerPart.match(/name="dropboxPath"\r\n\r\n([^\r\n]+)/);
 
-        // Extract filename
-        const filenameMatch = bodyStr.match(/filename="([^"]+)"/);
         const filename = filenameMatch ? filenameMatch[1] : 'file';
+        const dropboxPath = pathMatch ? pathMatch[1] : `/Jindal/Creatives/${filename}`;
 
-        // Extract file content type
-        const contentTypeMatch = bodyStr.match(/Content-Type: ([^\r\n]+)/);
-        
-        // Extract binary file data
-        const dataStart = bodyStr.indexOf('\r\n\r\n', bodyStr.indexOf('Content-Type:')) + 4;
+        // Extract file binary data
+        const dataStart = bodyStr.indexOf('\r\n\r\n', bodyStr.indexOf('Content-Type')) + 4;
         const dataEnd = bodyStr.lastIndexOf('\r\n--');
         const fileData = Buffer.from(bodyStr.substring(dataStart, dataEnd), 'binary');
 
-        // Step 1 — Upload to Dropbox
-        const uploadArg = JSON.stringify({
-          path: dropboxPath,
-          mode: 'add',
-          autorename: true
-        });
+        // Upload to Dropbox
+        const uploadArg = JSON.stringify({ path: dropboxPath, mode: 'add', autorename: true });
 
-        const uploadOptions = {
+        const options = {
           hostname: 'content.dropboxapi.com',
           path: '/2/files/upload',
           method: 'POST',
@@ -86,69 +80,108 @@ http.createServer(async (req, res) => {
           }
         };
 
-        const uploadResult = await new Promise((resolve, reject) => {
-          const uploadReq = https.request(uploadOptions, r => {
-            let data = '';
-            r.on('data', d => data += d);
-            r.on('end', () => resolve(JSON.parse(data)));
+        const upload = https.request(options, r => {
+          let data = '';
+          r.on('data', d => data += d);
+          r.on('end', () => {
+            const result = JSON.parse(data);
+            // Get shared link
+            const linkOptions = {
+              hostname: 'api.dropboxapi.com',
+              path: '/2/sharing/create_shared_link_with_settings',
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${DROPBOX_TOKEN}`,
+                'Content-Type': 'application/json'
+              }
+            };
+            const linkData = JSON.stringify({ path: result.path_display, settings: { requested_visibility: 'public' } });
+            const linkReq = https.request(linkOptions, lr => {
+              let ld = '';
+              lr.on('data', d => ld += d);
+              lr.on('end', () => {
+                const linkResult = JSON.parse(ld);
+                const shareUrl = linkResult.url || linkResult.error?.shared_link_already_exists?.metadata?.url;
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true, path: result.path_display, url: shareUrl }));
+              });
+            });
+            linkReq.write(linkData);
+            linkReq.end();
           });
-          uploadReq.on('error', reject);
-          uploadReq.write(fileData);
-          uploadReq.end();
         });
 
-        if (uploadResult.error_summary) {
-          throw new Error(uploadResult.error_summary);
-        }
-
-        // Step 2 — Create shared link
-        const linkOptions = {
-          hostname: 'api.dropboxapi.com',
-          path: '/2/sharing/create_shared_link_with_settings',
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${DROPBOX_TOKEN}`,
-            'Content-Type': 'application/json'
-          }
-        };
-
-        const linkBody = JSON.stringify({
-          path: uploadResult.path_display,
-          settings: { requested_visibility: 'public' }
-        });
-
-        const linkResult = await new Promise((resolve, reject) => {
-          const linkReq = https.request(linkOptions, r => {
-            let data = '';
-            r.on('data', d => data += d);
-            r.on('end', () => resolve(JSON.parse(data)));
-          });
-          linkReq.on('error', reject);
-          linkReq.write(linkBody);
-          linkReq.end();
-        });
-
-        // Handle already shared link
-        const shareUrl = linkResult.url ||
-          linkResult.error?.shared_link_already_exists?.metadata?.url ||
-          uploadResult.path_display;
-
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          success: true,
-          path: uploadResult.path_display,
-          url: shareUrl
-        }));
+        upload.on('error', e => { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); });
+        upload.write(fileData);
+        upload.end();
 
       } catch(e) {
-        res.writeHead(500);
-        res.end(JSON.stringify({ error: e.message }));
+        res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
       }
     });
     return;
   }
 
-  res.writeHead(200);
-  res.end('Yellow Productions backend running');
+  // Dropbox move file (on approval)
+  if (req.method === 'POST' && req.url === '/api/dropbox-move') {
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', () => {
+      try {
+        const { fromPath, toFolder } = JSON.parse(body);
+        if (!fromPath) {
+          res.writeHead(400); res.end(JSON.stringify({ error: 'fromPath required' })); return;
+        }
+
+        // Build destination path — keep filename, move to Approved folder
+        const filename = fromPath.split('/').pop();
+        const destination = toFolder
+          ? `${toFolder}/${filename}`
+          : `/Jindal/Creatives/Approved/${filename}`;
+
+        const moveData = JSON.stringify({
+          from_path: fromPath,
+          to_path: destination,
+          autorename: true
+        });
+
+        const options = {
+          hostname: 'api.dropboxapi.com',
+          path: '/2/files/move_v2',
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${DROPBOX_TOKEN}`,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(moveData)
+          }
+        };
+
+        const moveReq = https.request(options, r => {
+          let data = '';
+          r.on('data', d => data += d);
+          r.on('end', () => {
+            const result = JSON.parse(data);
+            if (result.metadata) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: true, path: result.metadata.path_display }));
+            } else {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: result }));
+            }
+          });
+        });
+
+        moveReq.on('error', e => { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); });
+        moveReq.write(moveData);
+        moveReq.end();
+
+      } catch(e) {
+        res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404); res.end('Not found');
 
 }).listen(PORT, () => console.log(`Yellow Productions backend running on port ${PORT}`));
