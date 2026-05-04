@@ -178,7 +178,24 @@ http.createServer(async (req, res) => {
               try {
                 const j = JSON.parse(d);
                 if (j.error && j.error['.tag'] === 'shared_link_already_exists') {
-                  resolve({ url: j.error.metadata ? j.error.metadata.url : uploadRes.path_display });
+                  // Link exists - get it via list_shared_links
+                  const listPayload = JSON.stringify({ path: uploadRes.path_display });
+                  const listReq = https.request({
+                    hostname: 'api.dropboxapi.com', path: '/2/sharing/list_shared_links',
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(listPayload) }
+                  }, listRes => {
+                    let ld = ''; listRes.on('data', x => ld += x);
+                    listRes.on('end', () => {
+                      try {
+                        const lj = JSON.parse(ld);
+                        const existingUrl = lj.links && lj.links[0] ? lj.links[0].url : uploadRes.path_display;
+                        resolve({ url: existingUrl });
+                      } catch(e) { resolve({ url: uploadRes.path_display }); }
+                    });
+                  });
+                  listReq.on('error', () => resolve({ url: uploadRes.path_display }));
+                  listReq.write(listPayload); listReq.end();
                 } else if (j.error) {
                   reject(new Error(j.error_summary || JSON.stringify(j.error)));
                 } else {
