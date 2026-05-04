@@ -2,7 +2,51 @@ const https = require('https');
 const http = require('http');
 const PORT = process.env.PORT || 10000;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-const DROPBOX_TOKEN = process.env.DROPBOX_TOKEN;
+const DROPBOX_REFRESH_TOKEN = process.env.DROPBOX_REFRESH_TOKEN;
+const DROPBOX_APP_KEY = process.env.DROPBOX_APP_KEY;
+const DROPBOX_APP_SECRET = process.env.DROPBOX_APP_SECRET;
+
+// Cache access token
+let cachedToken = null;
+let tokenExpiry = 0;
+
+async function getDropboxToken() {
+  if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
+  
+  const payload = `grant_type=refresh_token&refresh_token=${DROPBOX_REFRESH_TOKEN}&client_id=${DROPBOX_APP_KEY}&client_secret=${DROPBOX_APP_SECRET}`;
+  
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api.dropbox.com',
+      path: '/oauth2/token',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    };
+    const req = https.request(options, res => {
+      let d = '';
+      res.on('data', x => d += x);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(d);
+          if (json.access_token) {
+            cachedToken = json.access_token;
+            tokenExpiry = Date.now() + (json.expires_in - 300) * 1000; // refresh 5 min early
+            console.log('Dropbox token refreshed successfully');
+            resolve(cachedToken);
+          } else {
+            reject(new Error('No access token: ' + d));
+          }
+        } catch(e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+}
 
 function setCORS(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -13,6 +57,13 @@ function setCORS(res) {
 http.createServer(async (req, res) => {
   setCORS(res);
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
+
+  // Health check
+  if (req.url === '/' || req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', service: 'yellowbackend' }));
+    return;
+  }
 
   // Claude API proxy
   if (req.method === 'POST' && req.url === '/api/claude') {
@@ -50,6 +101,7 @@ http.createServer(async (req, res) => {
     req.on('data', d => chunks.push(d));
     req.on('end', async () => {
       try {
+        const token = await getDropboxToken();
         const buffer = Buffer.concat(chunks);
         const contentType = req.headers['content-type'] || '';
         const boundaryMatch = contentType.match(/boundary=(.+)$/);
@@ -79,14 +131,16 @@ http.createServer(async (req, res) => {
 
         if (!fileBuffer) throw new Error('No file found in upload');
 
-        // Upload to Dropbox
+        console.log(`Uploading to Dropbox: ${dropboxPath} (${fileBuffer.length} bytes)`);
+
+        // Upload file to Dropbox
         const uploadRes = await new Promise((resolve, reject) => {
           const options = {
             hostname: 'content.dropboxapi.com',
             path: '/2/files/upload',
             method: 'POST',
             headers: {
-              'Authorization': 'Bearer ' + DROPBOX_TOKEN,
+              'Authorization': 'Bearer ' + token,
               'Content-Type': 'application/octet-stream',
               'Dropbox-API-Arg': JSON.stringify({ path: dropboxPath, mode: 'overwrite', autorename: true })
             }
@@ -94,12 +148,16 @@ http.createServer(async (req, res) => {
           const r = https.request(options, res => {
             const c = []; res.on('data', d => c.push(d));
             res.on('end', () => {
-              try { const j = JSON.parse(Buffer.concat(c).toString()); j.error ? reject(new Error(j.error_summary)) : resolve(j); }
-              catch(e) { reject(e); }
+              try {
+                const j = JSON.parse(Buffer.concat(c).toString());
+                j.error ? reject(new Error(j.error_summary || JSON.stringify(j.error))) : resolve(j);
+              } catch(e) { reject(e); }
             });
           });
           r.on('error', reject); r.write(fileBuffer); r.end();
         });
+
+        console.log('Upload success:', uploadRes.path_display);
 
         // Create shared link
         const linkPayload = JSON.stringify({ path: uploadRes.path_display, settings: { requested_visibility: 'public' } });
@@ -109,7 +167,7 @@ http.createServer(async (req, res) => {
             path: '/2/sharing/create_shared_link_with_settings',
             method: 'POST',
             headers: {
-              'Authorization': 'Bearer ' + DROPBOX_TOKEN,
+              'Authorization': 'Bearer ' + token,
               'Content-Type': 'application/json',
               'Content-Length': Buffer.byteLength(linkPayload)
             }
@@ -119,9 +177,8 @@ http.createServer(async (req, res) => {
             res.on('end', () => {
               try {
                 const j = JSON.parse(d);
-                // 409 means link already exists — get existing
                 if (j.error && j.error['.tag'] === 'shared_link_already_exists') {
-                  resolve({ url: j.error.metadata ? j.error.metadata.url : '' });
+                  resolve({ url: j.error.metadata ? j.error.metadata.url : uploadRes.path_display });
                 } else if (j.error) {
                   reject(new Error(j.error_summary || JSON.stringify(j.error)));
                 } else {
@@ -134,6 +191,7 @@ http.createServer(async (req, res) => {
         });
 
         const shareUrl = (linkRes.url || '').replace('?dl=0', '?raw=1');
+        console.log('Share URL:', shareUrl);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, url: shareUrl, path: uploadRes.path_display }));
 
@@ -152,17 +210,19 @@ http.createServer(async (req, res) => {
     req.on('data', d => body += d);
     req.on('end', async () => {
       try {
+        const token = await getDropboxToken();
         const { fromPath, toFolder } = JSON.parse(body);
         const fileName = fromPath.split('/').pop();
         const toPath = toFolder + '/' + fileName;
         const payload = JSON.stringify({ from_path: fromPath, to_path: toPath, autorename: true });
+        
         const result = await new Promise((resolve, reject) => {
           const options = {
             hostname: 'api.dropboxapi.com',
             path: '/2/files/move_v2',
             method: 'POST',
             headers: {
-              'Authorization': 'Bearer ' + DROPBOX_TOKEN,
+              'Authorization': 'Bearer ' + token,
               'Content-Type': 'application/json',
               'Content-Length': Buffer.byteLength(payload)
             }
@@ -173,6 +233,7 @@ http.createServer(async (req, res) => {
           });
           r.on('error', reject); r.write(payload); r.end();
         });
+
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, path: result.metadata?.path_display }));
       } catch (e) {
@@ -184,8 +245,6 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // Health check
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ status: 'ok', service: 'yellowbackend' }));
+  res.writeHead(404); res.end('Not found');
 
 }).listen(PORT, () => console.log('Yellowbackend running on port ' + PORT));
