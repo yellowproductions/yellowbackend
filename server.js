@@ -54,6 +54,31 @@ function setCORS(res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
+// Ensure a Dropbox folder exists. Silently ignores "already exists" errors
+// and any other failures — if it can't create, the subsequent move will surface
+// the real error.
+function ensureFolder(token, folderPath) {
+  return new Promise(resolve => {
+    const payload = JSON.stringify({ path: folderPath, autorename: false });
+    const options = {
+      hostname: 'api.dropboxapi.com',
+      path: '/2/files/create_folder_v2',
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    };
+    const r = https.request(options, res => {
+      let d = ''; res.on('data', x => d += x);
+      res.on('end', () => resolve()); // success or "already exists" — both fine
+    });
+    r.on('error', () => resolve());
+    r.write(payload); r.end();
+  });
+}
+
 http.createServer(async (req, res) => {
   setCORS(res);
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
@@ -112,7 +137,7 @@ http.createServer(async (req, res) => {
         const parts = bufStr.split('--' + boundary);
         let fileBuffer = null;
         let fileName = 'upload.jpg';
-        let dropboxPath = '/Yellowverse/Uploads/upload.jpg';
+        let dropboxPath = '/JINDAL/Pending/upload.jpg';
 
         for (const part of parts) {
           if (part.includes('name="file"')) {
@@ -228,9 +253,13 @@ http.createServer(async (req, res) => {
     req.on('end', async () => {
       try {
         const token = await getDropboxToken();
-        const { fromPath, toFolder } = JSON.parse(body);
-        const fileName = fromPath.split('/').pop();
+        const { fromPath, toFolder, toFilename } = JSON.parse(body);
+        const fileName = toFilename || fromPath.split('/').pop();
         const toPath = toFolder + '/' + fileName;
+
+        // Make sure destination folder exists — handles /REJECTED, new client folders, etc.
+        await ensureFolder(token, toFolder);
+
         const payload = JSON.stringify({ from_path: fromPath, to_path: toPath, autorename: true });
         
         const result = await new Promise((resolve, reject) => {
@@ -259,6 +288,88 @@ http.createServer(async (req, res) => {
         res.end(JSON.stringify({ success: false, error: e.message }));
       }
     });
+    return;
+  }
+
+  // Dropbox cleanup — delete files in /REJECTED older than 30 days.
+  // Called daily by the Google Apps Script time trigger.
+  if (req.method === 'POST' && req.url === '/api/dropbox-cleanup-rejected') {
+    (async () => {
+      try {
+        const token = await getDropboxToken();
+        const folderPath = '/REJECTED';
+        const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+
+        // List folder contents
+        const listPayload = JSON.stringify({ path: folderPath, recursive: false });
+        const entries = await new Promise((resolve, reject) => {
+          const options = {
+            hostname: 'api.dropboxapi.com', path: '/2/files/list_folder', method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(listPayload) }
+          };
+          const r = https.request(options, res => {
+            let d = ''; res.on('data', x => d += x);
+            res.on('end', () => {
+              try {
+                const j = JSON.parse(d);
+                if (j.error) {
+                  // Folder doesn't exist yet — nothing to clean
+                  if ((j.error_summary || '').includes('not_found')) resolve([]);
+                  else reject(new Error(j.error_summary || JSON.stringify(j.error)));
+                } else resolve(j.entries || []);
+              } catch(e) { reject(e); }
+            });
+          });
+          r.on('error', reject); r.write(listPayload); r.end();
+        });
+
+        // Find files older than 30 days. Prefer the YYYY-MM-DD_ filename prefix
+        // (set when the file was rejected); fall back to server_modified.
+        const datePrefixRegex = /^(\d{4}-\d{2}-\d{2})_/;
+        const toDelete = entries.filter(e => {
+          if (e['.tag'] !== 'file') return false;
+          const m = (e.name || '').match(datePrefixRegex);
+          const fileTime = m ? new Date(m[1]).getTime()
+                             : (e.server_modified ? new Date(e.server_modified).getTime() : 0);
+          return fileTime > 0 && fileTime < cutoff;
+        });
+
+        let deleted = 0;
+        for (const entry of toDelete) {
+          try {
+            await new Promise((resolve, reject) => {
+              const delPayload = JSON.stringify({ path: entry.path_display });
+              const options = {
+                hostname: 'api.dropboxapi.com', path: '/2/files/delete_v2', method: 'POST',
+                headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(delPayload) }
+              };
+              const r = https.request(options, res => {
+                let d = ''; res.on('data', x => d += x);
+                res.on('end', () => {
+                  try {
+                    const j = JSON.parse(d);
+                    if (j.error) reject(new Error(j.error_summary || JSON.stringify(j.error)));
+                    else resolve(j);
+                  } catch(e) { reject(e); }
+                });
+              });
+              r.on('error', reject); r.write(delPayload); r.end();
+            });
+            deleted++;
+          } catch(e) {
+            console.log('Delete failed for', entry.path_display, ':', e.message);
+          }
+        }
+
+        console.log(`Cleanup: deleted ${deleted}/${toDelete.length} files (>30 days) from ${folderPath}, ${entries.length} total`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, deleted, eligible: toDelete.length, total: entries.length }));
+      } catch (e) {
+        console.error('Cleanup error:', e.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    })();
     return;
   }
 
