@@ -253,7 +253,35 @@ http.createServer(async (req, res) => {
     req.on('end', async () => {
       try {
         const token = await getDropboxToken();
-        const { fromPath, toFolder, toFilename } = JSON.parse(body);
+        let { fromPath, toFolder, toFilename } = JSON.parse(body);
+
+        // If fromPath is a shared HTTPS URL (https://www.dropbox.com/...), resolve it to the internal path
+        if (fromPath && fromPath.startsWith('http')) {
+          const lookup = JSON.stringify({ url: fromPath });
+          const resolved = await new Promise((resolve, reject) => {
+            const opts = {
+              hostname: 'api.dropboxapi.com',
+              path: '/2/sharing/get_shared_link_metadata',
+              method: 'POST',
+              headers: {
+                'Authorization': 'Bearer ' + token,
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(lookup)
+              }
+            };
+            const rr = https.request(opts, rs => {
+              let d = ''; rs.on('data', x => d += x);
+              rs.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+            });
+            rr.on('error', reject); rr.write(lookup); rr.end();
+          });
+          if (resolved && resolved.path_lower) {
+            fromPath = resolved.path_lower;
+          } else if (resolved && resolved.error) {
+            throw new Error('Could not resolve shared URL: ' + JSON.stringify(resolved.error));
+          }
+        }
+
         const fileName = toFilename || fromPath.split('/').pop();
         const toPath = toFolder + '/' + fileName;
 
