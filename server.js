@@ -1,10 +1,57 @@
 const https = require('https');
 const http = require('http');
+const crypto = require('crypto');
 const PORT = process.env.PORT || 10000;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const DROPBOX_REFRESH_TOKEN = process.env.DROPBOX_REFRESH_TOKEN;
 const DROPBOX_APP_KEY = process.env.DROPBOX_APP_KEY;
 const DROPBOX_APP_SECRET = process.env.DROPBOX_APP_SECRET;
+
+// =================== AUTH (Step 1) ===================
+// Passwords live in Render env vars — never in code, never in browser source.
+//
+// Required env vars:
+//   TEAM_PASSWORDS    "Faizan:faizan47,Sandesh:sandesh82,..."  (Name:password, comma-separated)
+//   CLIENT_PASSWORDS  "jindal:Jindal2026,kotak:Kotak2026,adhoc:Adhoc2026,pitches:Pitches2026"
+//   MASTER_PASSWORD   "Yellow@1234"   (founder + universal client unlock)
+//   JWT_SECRET        "<random long string>"  (rotate to invalidate everyone's session)
+const JWT_SECRET = process.env.JWT_SECRET || 'CHANGE_ME_IN_RENDER_ENV';
+const MASTER_PASSWORD = process.env.MASTER_PASSWORD || '';
+
+function parseEnvMap(raw) {
+  const out = {};
+  (raw || '').split(',').forEach(pair => {
+    const [k, v] = pair.split(':');
+    if (k && v) out[k.trim()] = v.trim();
+  });
+  return out;
+}
+const TEAM_PASSWORDS   = parseEnvMap(process.env.TEAM_PASSWORDS);   // {Faizan:'faizan47',...}
+const CLIENT_PASSWORDS = parseEnvMap(process.env.CLIENT_PASSWORDS); // {jindal:'Jindal2026',...}
+
+const SESSION_DAYS = 7;
+
+// Sign a tamper-resistant token: <base64-payload>.<hmac-signature>
+function signToken(payload) {
+  const body = JSON.stringify({ ...payload, expires: Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000 });
+  const b64 = Buffer.from(body).toString('base64url');
+  const sig = crypto.createHmac('sha256', JWT_SECRET).update(b64).digest('base64url');
+  return `${b64}.${sig}`;
+}
+
+// Verify a token — returns payload if valid + unexpired, else null
+function verifyToken(token) {
+  if (!token || typeof token !== 'string') return null;
+  const [b64, sig] = token.split('.');
+  if (!b64 || !sig) return null;
+  const expected = crypto.createHmac('sha256', JWT_SECRET).update(b64).digest('base64url');
+  if (sig !== expected) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(b64, 'base64url').toString());
+    if (payload.expires && payload.expires < Date.now()) return null;
+    return payload;
+  } catch(e) { return null; }
+}
 
 // Cache access token
 let cachedToken = null;
@@ -87,6 +134,96 @@ http.createServer(async (req, res) => {
   if (req.url === '/' || req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', service: 'yellowbackend' }));
+    return;
+  }
+
+  // ============== AUTH: LOGIN ==============
+  // POST /api/login  body: { role: 'team'|'founder'|'client', username?, password }
+  // Returns: { success: true, token, user, role, scope? } or 401
+  if (req.method === 'POST' && req.url === '/api/login') {
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', () => {
+      try {
+        const { role, username, password } = JSON.parse(body || '{}');
+        if (!role || !password) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ success: false, error: 'Missing role or password' }));
+        }
+
+        // FOUNDER — master password only
+        if (role === 'founder') {
+          if (MASTER_PASSWORD && password === MASTER_PASSWORD) {
+            const token = signToken({ user: 'Suriti', role: 'founder' });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ success: true, token, user: 'Suriti', role: 'founder' }));
+          }
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ success: false, error: 'Invalid credentials' }));
+        }
+
+        // TEAM — find which user matches this password
+        if (role === 'team') {
+          // If username supplied, check that pair specifically
+          if (username && TEAM_PASSWORDS[username] && TEAM_PASSWORDS[username] === password) {
+            const token = signToken({ user: username, role: 'team' });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ success: true, token, user: username, role: 'team' }));
+          }
+          // Otherwise: reverse-lookup which user has this password (legacy single-field flow)
+          const matchedUser = Object.keys(TEAM_PASSWORDS).find(u => TEAM_PASSWORDS[u] === password);
+          if (matchedUser) {
+            const token = signToken({ user: matchedUser, role: 'team' });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ success: true, token, user: matchedUser, role: 'team' }));
+          }
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ success: false, error: 'Invalid credentials' }));
+        }
+
+        // CLIENT — master password unlocks all portals; otherwise portal-specific
+        if (role === 'client') {
+          if (MASTER_PASSWORD && password === MASTER_PASSWORD) {
+            const token = signToken({ user: username || 'Internal', role: 'client', scope: 'all' });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ success: true, token, user: username || 'Internal', role: 'client', scope: 'all' }));
+          }
+          for (const [portal, pwd] of Object.entries(CLIENT_PASSWORDS)) {
+            if (password === pwd) {
+              const token = signToken({ user: username || 'Client', role: 'client', scope: portal });
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              return res.end(JSON.stringify({ success: true, token, user: username || 'Client', role: 'client', scope: portal }));
+            }
+          }
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ success: false, error: 'Invalid credentials' }));
+        }
+
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'Invalid role' }));
+      } catch(e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'Bad request' }));
+      }
+    });
+    return;
+  }
+
+  // Optional: token verification endpoint (for future Step 2 — protect data endpoints)
+  if (req.method === 'POST' && req.url === '/api/verify') {
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', () => {
+      try {
+        const { token } = JSON.parse(body || '{}');
+        const payload = verifyToken(token);
+        res.writeHead(payload ? 200 : 401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(payload ? { valid: true, ...payload } : { valid: false }));
+      } catch(e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ valid: false }));
+      }
+    });
     return;
   }
 
