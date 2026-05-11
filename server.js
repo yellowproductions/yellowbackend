@@ -31,6 +31,55 @@ const CLIENT_PASSWORDS = parseEnvMap(process.env.CLIENT_PASSWORDS); // {jindal:'
 
 const SESSION_DAYS = 7;
 
+// =================== TELEGRAM NOTIFICATIONS ===================
+// Required Render env vars:
+//   TELEGRAM_BOT_TOKEN  → from @BotFather, e.g. "8528860335:AAGF..."
+//   TELEGRAM_CHATS      → "Suriti:8751122054,Viplav:1234567,Faizan:9876543"
+//                         The bot only sends to people listed here. New people
+//                         need to register their Telegram ID first.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHATS     = parseEnvMap(process.env.TELEGRAM_CHATS); // {Suriti:'8751...', Viplav:'...'}
+
+// Send a message to a specific Telegram chat ID via the Bot API
+function sendTelegram(chatId, text) {
+  if (!TELEGRAM_BOT_TOKEN || !chatId) return Promise.resolve({ ok: false, skipped: true });
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      chat_id: String(chatId),
+      text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: false
+    });
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    }, (r) => {
+      let data = '';
+      r.on('data', d => data += d);
+      r.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch(e) { resolve({ ok: false, parseError: true }); }
+      });
+    });
+    req.on('error', (e) => resolve({ ok: false, error: e.message }));
+    req.write(body);
+    req.end();
+  });
+}
+
+// Resolve a "to" target (person name or "team") to chat IDs
+function resolveChats(to) {
+  if (!to) return [];
+  if (to === 'team' || to === 'all') {
+    // Broadcast to everyone registered
+    return Object.entries(TELEGRAM_CHATS).map(([name, id]) => ({ name, id }));
+  }
+  const id = TELEGRAM_CHATS[to];
+  return id ? [{ name: to, id }] : [];
+}
+
 // Sign a tamper-resistant token: <base64-payload>.<hmac-signature>
 function signToken(payload) {
   const body = JSON.stringify({ ...payload, expires: Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000 });
@@ -222,6 +271,51 @@ http.createServer(async (req, res) => {
       } catch(e) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ valid: false }));
+      }
+    });
+    return;
+  }
+
+  // ============== TELEGRAM NOTIFY ==============
+  // POST /api/notify  body: { to: "Viplav"|"Suriti"|"team", message: "<html-allowed text>" }
+  // Requires Authorization: Bearer <token> header (from /api/login)
+  if (req.method === 'POST' && req.url === '/api/notify') {
+    // Validate auth — only logged-in users can trigger notifications
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.replace(/^Bearer\s+/i, '');
+    const payload = verifyToken(token);
+    if (!payload) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: false, error: 'Not authenticated' }));
+    }
+
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', async () => {
+      try {
+        const { to, message } = JSON.parse(body || '{}');
+        if (!to || !message) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ success: false, error: 'Missing to or message' }));
+        }
+        const targets = resolveChats(to);
+        if (!targets.length) {
+          // Silently succeed — recipient just isn't registered for Telegram yet
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ success: true, sent: 0, note: 'no registered chat for ' + to }));
+        }
+        // Send in parallel; don't fail the response if individual sends fail
+        const results = await Promise.all(
+          targets
+            // Don't notify the person who triggered the event (no self-pings)
+            .filter(t => t.name !== payload.user)
+            .map(t => sendTelegram(t.id, message).then(r => ({ name: t.name, ok: r.ok })))
+        );
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, sent: results.filter(r => r.ok).length, results }));
+      } catch(e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
       }
     });
     return;
