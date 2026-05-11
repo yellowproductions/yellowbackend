@@ -213,6 +213,14 @@ http.createServer(async (req, res) => {
 
         // TEAM — find which user matches this password
         if (role === 'team') {
+          // MASTER PASSWORD OVERRIDE — Suriti can log in as anyone using Yellow@1234.
+          // Useful when she needs to act on someone's behalf, or when an individual
+          // password gets lost / forgotten and the person is locked out.
+          if (MASTER_PASSWORD && password === MASTER_PASSWORD && username) {
+            const token = signToken({ user: username, role: 'team' });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ success: true, token, user: username, role: 'team' }));
+          }
           // If username supplied, check that pair specifically
           if (username && TEAM_PASSWORDS[username] && TEAM_PASSWORDS[username] === password) {
             const token = signToken({ user: username, role: 'team' });
