@@ -153,7 +153,9 @@ function setCORS(res) {
 // Ensure a Dropbox folder exists. Silently ignores "already exists" errors
 // and any other failures — if it can't create, the subsequent move will surface
 // the real error.
-function ensureFolder(token, folderPath) {
+// Create one folder. Resolves whether it actually got created OR already existed
+// OR errored — we don't distinguish, by design (idempotent ensure semantics).
+function createOneFolder(token, folderPath) {
   return new Promise(resolve => {
     const payload = JSON.stringify({ path: folderPath, autorename: false });
     const options = {
@@ -173,6 +175,20 @@ function ensureFolder(token, folderPath) {
     r.on('error', () => resolve());
     r.write(payload); r.end();
   });
+}
+
+// Walks a path and ensures every level exists. Dropbox's create_folder_v2 requires
+// the parent to already exist, so calling it once for '/Marico/Creatives' fails if
+// /Marico hasn't been made yet. Walking the path solves that — for a brand-new
+// client we create /Marico, then /Marico/Creatives, each step idempotent.
+async function ensureFolder(token, folderPath) {
+  if (!folderPath || folderPath === '/') return;
+  const parts = folderPath.split('/').filter(Boolean);
+  let acc = '';
+  for (const p of parts) {
+    acc += '/' + p;
+    await createOneFolder(token, acc);
+  }
 }
 
 http.createServer(async (req, res) => {
@@ -367,33 +383,58 @@ http.createServer(async (req, res) => {
       try {
         const token = await getDropboxToken();
         const buffer = Buffer.concat(chunks);
+        chunks.length = 0;  // free the chunk array — buffer holds everything now
         const contentType = req.headers['content-type'] || '';
         const boundaryMatch = contentType.match(/boundary=(.+)$/);
         if (!boundaryMatch) throw new Error('No boundary in multipart form');
         const boundary = boundaryMatch[1];
 
-        const bufStr = buffer.toString('binary');
-        const parts = bufStr.split('--' + boundary);
+        // Buffer-only multipart parsing. The old version did buffer.toString('binary')
+        // and string.split(), which holds the entire upload in memory 3–4× over.
+        // For 50MB+ PSD uploads on Render's 512MB tier, that's enough to trigger OOM.
+        // Now we slice the original buffer directly — Buffer.slice returns a VIEW into
+        // the same memory, so peak usage stays at roughly 1× the upload size.
+        const boundaryBytes = Buffer.from('--' + boundary);
+        const headerSep = Buffer.from('\r\n\r\n');
         let fileBuffer = null;
         let fileName = 'upload.jpg';
-        let dropboxPath = '/JINDAL/Pending/upload.jpg';
+        let dropboxPath = null;  // No silent fallback — must be set by the form
 
-        for (const part of parts) {
-          if (part.includes('name="file"')) {
-            const match = part.match(/filename="([^"]+)"/);
-            if (match) fileName = match[1];
-            const bodyStart = part.indexOf('\r\n\r\n') + 4;
-            const bodyEnd = part.lastIndexOf('\r\n');
-            fileBuffer = Buffer.from(part.slice(bodyStart, bodyEnd), 'binary');
-          }
-          if (part.includes('name="dropboxPath"')) {
-            const bodyStart = part.indexOf('\r\n\r\n') + 4;
-            const bodyEnd = part.lastIndexOf('\r\n');
-            dropboxPath = part.slice(bodyStart, bodyEnd).trim();
+        // Find all boundary positions, then iterate the segments between them.
+        const positions = [];
+        let p = 0;
+        while ((p = buffer.indexOf(boundaryBytes, p)) !== -1) {
+          positions.push(p);
+          p += boundaryBytes.length;
+        }
+        for (let i = 0; i < positions.length - 1; i++) {
+          const segStart = positions[i] + boundaryBytes.length;
+          const segEnd   = positions[i + 1];
+          const headerEnd = buffer.indexOf(headerSep, segStart);
+          if (headerEnd === -1 || headerEnd >= segEnd) continue;
+          const headers = buffer.slice(segStart, headerEnd).toString('utf8');
+          const bodyStart = headerEnd + 4;
+          const bodyEnd   = segEnd - 2;  // strip the \r\n before the next boundary
+          if (headers.includes('name="file"')) {
+            const m = headers.match(/filename="([^"]+)"/);
+            if (m) fileName = m[1];
+            fileBuffer = buffer.slice(bodyStart, bodyEnd);  // view, no copy
+          } else if (headers.includes('name="dropboxPath"')) {
+            dropboxPath = buffer.slice(bodyStart, bodyEnd).toString('utf8').trim();
           }
         }
 
         if (!fileBuffer) throw new Error('No file found in upload');
+        // Fail loud if the form didn't include a dropboxPath. The old code defaulted to
+        // '/JINDAL/Pending/upload.jpg', which silently routed every broken Kotak / Marico /
+        // anything-else upload into the Jindal Pending folder. That bug is now gone.
+        if (!dropboxPath) throw new Error('Missing dropboxPath in upload form — refusing to write to a default folder');
+
+        // Ensure every folder in the target path exists before uploading. Required for
+        // brand-new clients like /Marico/Open Files/file.psd where neither /Marico nor
+        // /Marico/Open Files exists yet — Dropbox upload otherwise errors with path/not_found.
+        const parentDir = dropboxPath.substring(0, dropboxPath.lastIndexOf('/'));
+        if (parentDir) await ensureFolder(token, parentDir);
 
         console.log(`Uploading to Dropbox: ${dropboxPath} (${fileBuffer.length} bytes)`);
 
