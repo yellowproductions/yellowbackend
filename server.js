@@ -191,6 +191,59 @@ async function ensureFolder(token, folderPath) {
   }
 }
 
+// Get-or-create a Dropbox shared link for a file OR folder path. Resolves to the
+// share URL (with ?dl=0 swapped to ?raw=1 for direct content access on files).
+// If a share already exists for this path, fetches the existing one instead of
+// erroring. Used by both the per-file upload flow and the new folder-share endpoint.
+function getOrCreateSharedLink(token, dropboxPath) {
+  return new Promise((resolve, reject) => {
+    const linkPayload = JSON.stringify({ path: dropboxPath, settings: { requested_visibility: 'public' } });
+    const options = {
+      hostname: 'api.dropboxapi.com',
+      path: '/2/sharing/create_shared_link_with_settings',
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(linkPayload)
+      }
+    };
+    const r = https.request(options, resp => {
+      let d = ''; resp.on('data', x => d += x);
+      resp.on('end', () => {
+        try {
+          const j = JSON.parse(d);
+          if (j.error && j.error['.tag'] === 'shared_link_already_exists') {
+            // Fetch existing link
+            const listPayload = JSON.stringify({ path: dropboxPath });
+            const listReq = https.request({
+              hostname: 'api.dropboxapi.com', path: '/2/sharing/list_shared_links',
+              method: 'POST',
+              headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(listPayload) }
+            }, listRes => {
+              let ld = ''; listRes.on('data', x => ld += x);
+              listRes.on('end', () => {
+                try {
+                  const lj = JSON.parse(ld);
+                  const existingUrl = lj.links && lj.links[0] ? lj.links[0].url : '';
+                  resolve((existingUrl || '').replace('?dl=0', '?raw=1'));
+                } catch(e) { resolve(''); }
+              });
+            });
+            listReq.on('error', () => resolve(''));
+            listReq.write(listPayload); listReq.end();
+          } else if (j.error) {
+            reject(new Error(j.error_summary || JSON.stringify(j.error)));
+          } else {
+            resolve((j.url || '').replace('?dl=0', '?raw=1'));
+          }
+        } catch(e) { reject(e); }
+      });
+    });
+    r.on('error', reject); r.write(linkPayload); r.end();
+  });
+}
+
 http.createServer(async (req, res) => {
   setCORS(res);
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
@@ -527,6 +580,37 @@ http.createServer(async (req, res) => {
   }
 
   // Dropbox Move
+  if (req.method === 'POST' && req.url === '/api/dropbox-share-folder') {
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', async () => {
+      try {
+        const { folderPath } = JSON.parse(body || '{}');
+        if (!folderPath || typeof folderPath !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'folderPath required' }));
+          return;
+        }
+        const token = await getDropboxToken();
+        // Ensure folder exists (idempotent — no-op if it's already there)
+        await ensureFolder(token, folderPath);
+        const url = await getOrCreateSharedLink(token, folderPath);
+        if (!url) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'share link not returned' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, url, path: folderPath }));
+      } catch (e) {
+        console.error('dropbox-share-folder error:', e.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
   if (req.method === 'POST' && req.url === '/api/dropbox-move') {
     let body = '';
     req.on('data', d => body += d);
