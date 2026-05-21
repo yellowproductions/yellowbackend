@@ -765,6 +765,74 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  // Permanently delete specific files. Takes { urls: [...] } — each can be a
+  // shared HTTPS URL or an internal path. Used when a designer re-uploads
+  // reworked files so the old rejected versions are removed completely.
+  if (req.method === 'POST' && req.url === '/api/dropbox-delete') {
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', async () => {
+      try {
+        const token = await getDropboxToken();
+        const { urls } = JSON.parse(body || '{}');
+        const list = Array.isArray(urls) ? urls : [];
+        let deleted = 0;
+        for (let target of list) {
+          if (!target) continue;
+          try {
+            // Resolve shared URL → internal path
+            if (target.startsWith('http')) {
+              const lookup = JSON.stringify({ url: target });
+              const resolved = await new Promise((resolve, reject) => {
+                const opts = {
+                  hostname: 'api.dropboxapi.com', path: '/2/sharing/get_shared_link_metadata', method: 'POST',
+                  headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(lookup) }
+                };
+                const rr = https.request(opts, rs => {
+                  let d = ''; rs.on('data', x => d += x);
+                  rs.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+                });
+                rr.on('error', reject); rr.write(lookup); rr.end();
+              });
+              if (resolved && resolved.path_lower) target = resolved.path_lower;
+              else continue; // can't resolve — skip
+            }
+            const delPayload = JSON.stringify({ path: target });
+            await new Promise((resolve, reject) => {
+              const options = {
+                hostname: 'api.dropboxapi.com', path: '/2/files/delete_v2', method: 'POST',
+                headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(delPayload) }
+              };
+              const r = https.request(options, res2 => {
+                let d = ''; res2.on('data', x => d += x);
+                res2.on('end', () => {
+                  try {
+                    const j = JSON.parse(d);
+                    // Treat "already gone" as success
+                    if (j.error && !(j.error_summary || '').includes('not_found')) reject(new Error(j.error_summary));
+                    else resolve(j);
+                  } catch(e) { reject(e); }
+                });
+              });
+              r.on('error', reject); r.write(delPayload); r.end();
+            });
+            deleted++;
+          } catch(e) {
+            console.log('Delete failed for', target, ':', e.message);
+          }
+        }
+        console.log(`dropbox-delete: removed ${deleted}/${list.length} files`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, deleted, requested: list.length }));
+      } catch (e) {
+        console.error('dropbox-delete error:', e.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404); res.end('Not found');
 
 }).listen(PORT, () => console.log('Yellowbackend running on port ' + PORT));
