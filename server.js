@@ -306,10 +306,65 @@ async function dropboxListFolder(token, path, recursive) {
   return out;
 }
 
+// Raw content-API call (upload sessions). Body is ONE chunk (~8MB) so memory stays
+// tiny — this is what avoids the OOM crash on big files. append_v2 returns empty.
+function dropboxContent(token, apiPath, arg, body) {
+  return new Promise((resolve, reject) => {
+    const buf = body && body.length ? body : Buffer.alloc(0);
+    const r = https.request({
+      hostname: 'content.dropboxapi.com', path: apiPath, method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': buf.length,
+        'Dropbox-API-Arg': JSON.stringify(arg)
+      }
+    }, (resp) => {
+      let data = ''; resp.on('data', d => data += d);
+      resp.on('end', () => {
+        if (resp.statusCode >= 400) return reject(new Error(`Dropbox ${apiPath} ${resp.statusCode}: ${String(data).slice(0, 300)}`));
+        if (!data) return resolve({});
+        try { resolve(JSON.parse(data)); } catch(e) { resolve({}); }
+      });
+    });
+    r.on('error', reject);
+    if (buf.length) r.write(buf);
+    r.end();
+  });
+}
+
+// Create (or fetch existing) public share link for a path.
+function createOrGetSharedLink(token, path) {
+  return new Promise((resolve) => {
+    const payload = JSON.stringify({ path, settings: { requested_visibility: 'public' } });
+    const r = https.request({
+      hostname: 'api.dropboxapi.com', path: '/2/sharing/create_shared_link_with_settings', method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
+    }, (resp) => {
+      let d = ''; resp.on('data', x => d += x);
+      resp.on('end', () => {
+        try {
+          const j = JSON.parse(d);
+          if (j.url) return resolve(j.url);
+          if (j.error && j.error['.tag'] === 'shared_link_already_exists') {
+            const lp = JSON.stringify({ path });
+            const lr = https.request({ hostname: 'api.dropboxapi.com', path: '/2/sharing/list_shared_links', method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(lp) } }, lres => {
+              let ld = ''; lres.on('data', x => ld += x);
+              lres.on('end', () => { try { const lj = JSON.parse(ld); resolve((lj.links && lj.links[0] && lj.links[0].url) || ''); } catch(e) { resolve(''); } });
+            });
+            lr.on('error', () => resolve('')); lr.write(lp); lr.end();
+          } else { resolve(''); }
+        } catch(e) { resolve(''); }
+      });
+    });
+    r.on('error', () => resolve('')); r.write(payload); r.end();
+  });
+}
+
 function setCORS(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Phase, X-Session-Id, X-Offset, X-Path, X-List-Key');
 }
 
 // Ensure a Dropbox folder exists. Silently ignores "already exists" errors
@@ -843,6 +898,52 @@ http.createServer(async (req, res) => {
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // ===== Dropbox CHUNKED UPLOAD (memory-safe, any file size) =====
+  // POST /api/dropbox-chunk  raw body = one chunk; headers:
+  //   X-Phase: start|append|finish, X-Session-Id, X-Offset, X-Path (finish only)
+  // start → {session_id}; append → {success}; finish → {success, path, url}
+  if (req.method === 'POST' && req.url === '/api/dropbox-chunk') {
+    const parts = [];
+    req.on('data', d => parts.push(d));
+    req.on('end', async () => {
+      try {
+        const token = await getDropboxToken();
+        const body = Buffer.concat(parts);
+        parts.length = 0;
+        const phase = req.headers['x-phase'];
+        if (phase === 'start') {
+          const j = await dropboxContent(token, '/2/files/upload_session/start', { close: false }, body);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ success: true, session_id: j.session_id }));
+        }
+        if (phase === 'append') {
+          const sid = req.headers['x-session-id'];
+          const offset = parseInt(req.headers['x-offset'] || '0', 10);
+          await dropboxContent(token, '/2/files/upload_session/append_v2', { cursor: { session_id: sid, offset }, close: false }, body);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ success: true }));
+        }
+        if (phase === 'finish') {
+          const sid = req.headers['x-session-id'];
+          const offset = parseInt(req.headers['x-offset'] || '0', 10);
+          const path = decodeURIComponent(req.headers['x-path'] || '');
+          if (!path) throw new Error('Missing X-Path on finish');
+          const parentDir = path.substring(0, path.lastIndexOf('/'));
+          if (parentDir) await ensureFolder(token, parentDir);
+          const meta = await dropboxContent(token, '/2/files/upload_session/finish', { cursor: { session_id: sid, offset }, commit: { path, mode: 'overwrite', autorename: true } }, body);
+          const url = await createOrGetSharedLink(token, meta.path_display);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ success: true, path: meta.path_display, url }));
+        }
+        throw new Error('Unknown X-Phase');
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
       }
     });
     return;
