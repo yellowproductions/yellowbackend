@@ -525,6 +525,13 @@ http.createServer(async (req, res) => {
           }
         }
         let method, restBody = null, prefer = '';
+        // Privacy: a client must never receive internal task fields (the team's
+        // running updates/chat, internal notes, assignee, legacy file links). Force
+        // a safe column whitelist on client task reads, dropping the task_updates
+        // embed + notes regardless of what the client requested.
+        if (payload.role === 'client' && table === 'tasks' && action === 'select') {
+          q.columns = 'id,created_at,due_date,title,description,status,client,project_folder_link,doc_link,creative_link,open_link';
+        }
         const qs = buildDbQueryString(q, extraFilter);
         if (action === 'select') {
           method = 'GET';
