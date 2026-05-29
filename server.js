@@ -7,6 +7,14 @@ const DROPBOX_REFRESH_TOKEN = process.env.DROPBOX_REFRESH_TOKEN;
 const DROPBOX_APP_KEY = process.env.DROPBOX_APP_KEY;
 const DROPBOX_APP_SECRET = process.env.DROPBOX_APP_SECRET;
 
+// =================== SUPABASE (data gateway) ===================
+// The browser must NOT hit Supabase directly anymore. All reads/writes come
+// through /api/db, which uses the SERVICE ROLE key (bypasses RLS). Once every
+// portal routes through here, RLS can be enabled with no anon policies and the
+// public anon key becomes useless to anyone who copies it from the site source.
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://qchvnnicsoxptmmokozy.supabase.co';
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+
 // =================== AUTH (Step 1) ===================
 // Passwords live in Render env vars — never in code, never in browser source.
 //
@@ -100,6 +108,124 @@ function verifyToken(token) {
     if (payload.expires && payload.expires < Date.now()) return null;
     return payload;
   } catch(e) { return null; }
+}
+
+// =================== SUPABASE DATA GATEWAY HELPERS ===================
+const SUPABASE_REST = SUPABASE_URL.replace(/\/$/, '') + '/rest/v1';
+
+// What each role may do, per table. Letters: r=select, c=insert, u=update, d=delete.
+// founder = full access (handled separately). Start tight; loosen during P2 testing
+// if a legitimate portal action gets blocked.
+const DB_POLICY = {
+  team: {
+    tasks:         'rcu',
+    task_updates:  'rcu',
+    creatives:     'rcu',
+    attendance:    'rcu',
+    leaves:        'rcu',
+    chat_messages: 'rc',
+    reminders:     'rcud',
+    notifications: 'rcud',
+    clients:       'r',
+  },
+  client: {
+    tasks:         'r',
+    creatives:     'ru',     // client approves/rejects -> updates client_decision fields
+    notifications: 'rc',
+  },
+};
+
+// Client logins only see their own client's rows. Maps a login scope -> allowed
+// `client` column value(s). scope 'all' = internal (sees everything).
+// NOTE (P2): validate these names against client.html's actual tabs before go-live.
+const CLIENT_SCOPE_MAP = {
+  jindal:        ['Jindal Steel', 'Jindal League', 'Jindal Youth League', 'Sohar Steel', 'Jindal Steel Duqm'],
+  steelcity:     ['Jindal Steel'],
+  youthleague:   ['Jindal League'],
+  'jindal-youth':['Jindal Youth League'],
+  'sohar-steel': ['Sohar Steel'],
+  duqm:          ['Jindal Steel Duqm'],
+  kotak:         ['Kotak'],
+  marico:        ['Marico'],
+  zouk:          ['Zouk'],
+  pitches:       ['Pitches'],
+  adhoc:         ['Adhoc'],
+};
+
+function dbActionLetter(action) { return { select:'r', insert:'c', update:'u', delete:'d' }[action]; }
+
+// Returns null if allowed, or a denial reason string.
+function authorizeDb(payload, table, action) {
+  if (payload.role === 'founder') return null;                 // full access
+  const perms = (DB_POLICY[payload.role] || {})[table];
+  if (!perms) return `role '${payload.role}' has no access to table '${table}'`;
+  if (!perms.includes(dbActionLetter(action))) return `role '${payload.role}' cannot ${action} '${table}'`;
+  return null;
+}
+
+// Force a client-scope filter so a client login can't read other clients' rows.
+function dbScopeFilter(payload, table) {
+  if (payload.role !== 'client') return null;
+  if (payload.scope === 'all') return null;
+  if (table !== 'tasks' && table !== 'creatives') return null;
+  const names = CLIENT_SCOPE_MAP[payload.scope];
+  if (!names || !names.length) return { col: 'client', op: 'eq', val: '__no_matching_client__' }; // deny by default
+  return { col: 'client', op: 'in', val: names };
+}
+
+function pgEncodeVal(op, val) {
+  if (op === 'in') {
+    const items = (Array.isArray(val) ? val : [val]).map(v => `"${String(v).replace(/"/g, '""')}"`);
+    return `in.(${items.join(',')})`;
+  }
+  if (op === 'is') return `is.${val === null ? 'null' : val}`;
+  return `${op}.${val}`;
+}
+
+function buildDbQueryString(q, extraFilter) {
+  const parts = [];
+  if (q.action === 'select') parts.push('select=' + encodeURIComponent(q.columns || '*'));
+  const filters = Array.isArray(q.filters) ? q.filters.slice() : [];
+  if (extraFilter) filters.push(extraFilter);
+  filters.forEach(f => {
+    if (!f || !f.col || !f.op) return;
+    parts.push(`${encodeURIComponent(f.col)}=${encodeURIComponent(pgEncodeVal(f.op, f.val))}`);
+  });
+  if (Array.isArray(q.order)) q.order.forEach(o => {
+    if (o && o.col) parts.push('order=' + encodeURIComponent(`${o.col}.${o.asc === false ? 'desc' : 'asc'}`));
+  });
+  if (typeof q.limit === 'number') parts.push('limit=' + q.limit);
+  return parts.join('&');
+}
+
+// Raw-https call to the Supabase REST API using the service-role key.
+function supabaseRest(method, table, queryString, body, prefer) {
+  return new Promise((resolve) => {
+    const u = new URL(`${SUPABASE_REST}/${table}${queryString ? '?' + queryString : ''}`);
+    const payload = body != null ? JSON.stringify(body) : null;
+    const headers = {
+      'apikey': SUPABASE_SERVICE_KEY,
+      'Authorization': 'Bearer ' + SUPABASE_SERVICE_KEY,
+      'Content-Type': 'application/json',
+    };
+    if (prefer) headers['Prefer'] = prefer;
+    if (payload) headers['Content-Length'] = Buffer.byteLength(payload);
+    const r = https.request({ hostname: u.hostname, path: u.pathname + u.search, method, headers }, (resp) => {
+      let data = '';
+      resp.on('data', d => data += d);
+      resp.on('end', () => {
+        let parsed = null;
+        try { parsed = data ? JSON.parse(data) : null; } catch(e) { parsed = null; }
+        let count = null;
+        const cr = resp.headers['content-range'];
+        if (cr && cr.includes('/')) { const t = cr.split('/')[1]; if (t && t !== '*') count = parseInt(t, 10); }
+        resolve({ status: resp.statusCode, data: parsed, count });
+      });
+    });
+    r.on('error', (e) => resolve({ status: 0, data: null, count: null, error: e.message }));
+    if (payload) r.write(payload);
+    r.end();
+  });
 }
 
 // Cache access token
@@ -348,6 +474,81 @@ http.createServer(async (req, res) => {
       } catch(e) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ valid: false }));
+      }
+    });
+    return;
+  }
+
+  // ============== SUPABASE DATA GATEWAY ==============
+  // POST /api/db  body: { table, action: select|insert|update|delete, columns?,
+  //   filters?: [{col,op,val}], order?: [{col,asc}], limit?, single?, count?, head?, payload? }
+  // Requires Authorization: Bearer <token>. Authorized per DB_POLICY + client scope.
+  // Returns supabase-js-shaped { data, error, count } so the frontend shim is a drop-in.
+  if (req.method === 'POST' && req.url === '/api/db') {
+    const token = (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '');
+    const payload = verifyToken(token);
+    if (!payload) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ data: null, error: { message: 'Not authenticated' } }));
+    }
+    if (!SUPABASE_SERVICE_KEY) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ data: null, error: { message: 'Gateway not configured: SUPABASE_SERVICE_ROLE_KEY missing' } }));
+    }
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', async () => {
+      try {
+        const q = JSON.parse(body || '{}');
+        const table = q.table;
+        const action = q.action;
+        if (!table || !['select', 'insert', 'update', 'delete'].includes(action)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ data: null, error: { message: 'Bad request: table + valid action required' } }));
+        }
+        const denied = authorizeDb(payload, table, action);
+        if (denied) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ data: null, error: { message: denied } }));
+        }
+        const extraFilter = dbScopeFilter(payload, table);
+        // Safety net: never allow an unfiltered update/delete (would hit the whole table).
+        if (action === 'update' || action === 'delete') {
+          const hasFilter = (Array.isArray(q.filters) && q.filters.length) || extraFilter;
+          if (!hasFilter) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ data: null, error: { message: `Refusing unfiltered ${action}` } }));
+          }
+        }
+        let method, restBody = null, prefer = '';
+        const qs = buildDbQueryString(q, extraFilter);
+        if (action === 'select') {
+          method = 'GET';
+          if (q.count) prefer = `count=${q.count}`;
+        } else if (action === 'insert') {
+          method = 'POST'; restBody = q.payload; prefer = 'return=representation';
+        } else if (action === 'update') {
+          method = 'PATCH'; restBody = q.payload; prefer = 'return=representation';
+        } else if (action === 'delete') {
+          method = 'DELETE'; prefer = 'return=representation';
+        }
+        const result = await supabaseRest(method, table, qs, restBody, prefer);
+        if (!result.status || result.status >= 400) {
+          res.writeHead(result.status >= 400 ? result.status : 502, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({
+            data: null,
+            error: { message: (result.data && result.data.message) || result.error || 'Database error', details: result.data || null },
+            count: null
+          }));
+        }
+        let data = result.data;
+        if (q.single) data = Array.isArray(data) ? (data[0] || null) : data;
+        if (q.head) data = null;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ data, error: null, count: result.count }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ data: null, error: { message: e.message } }));
       }
     });
     return;
