@@ -117,13 +117,17 @@ const SUPABASE_REST = SUPABASE_URL.replace(/\/$/, '') + '/rest/v1';
 // founder = full access (handled separately). Start tight; loosen during P2 testing
 // if a legitimate portal action gets blocked.
 const DB_POLICY = {
+  // Authenticated internal staff (designers/copy/CS, and studio uploads which
+  // share the team login). Trusted — full CRUD on the operational tables. The
+  // security win for this role is that they're authenticated at all (vs the old
+  // anon key); external clients are the tightly-scoped role below.
   team: {
-    tasks:         'rcu',
-    task_updates:  'rcu',
-    creatives:     'rcu',
-    attendance:    'rcu',
-    leaves:        'rcu',
-    chat_messages: 'rc',
+    tasks:         'rcud',
+    task_updates:  'rcud',
+    creatives:     'rcud',
+    attendance:    'rcud',
+    leaves:        'rcud',
+    chat_messages: 'rcud',
     reminders:     'rcud',
     notifications: 'rcud',
     clients:       'r',
