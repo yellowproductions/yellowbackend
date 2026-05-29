@@ -15,6 +15,10 @@ const DROPBOX_APP_SECRET = process.env.DROPBOX_APP_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://qchvnnicsoxptmmokozy.supabase.co';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
+// Temporary read-only Dropbox folder-listing key (for the one-off folder-mapping
+// pass). Lists folder/file names only; cannot move or delete. DELETE after mapping.
+const DROPBOX_LIST_KEY = process.env.DROPBOX_LIST_KEY || '';
+
 // =================== AUTH (Step 1) ===================
 // Passwords live in Render env vars — never in code, never in browser source.
 //
@@ -272,6 +276,34 @@ async function getDropboxToken() {
     req.write(payload);
     req.end();
   });
+}
+
+// ===== Dropbox read-only listing helpers (for the folder-mapping pass) =====
+function dropboxApiCall(token, apiPath, payload) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const r = https.request({
+      hostname: 'api.dropboxapi.com', path: apiPath, method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    }, (resp) => {
+      let data = ''; resp.on('data', d => data += d);
+      resp.on('end', () => {
+        try { const j = JSON.parse(data); if (resp.statusCode >= 400) reject(new Error(j.error_summary || data)); else resolve(j); }
+        catch(e) { reject(new Error('Dropbox parse error: ' + String(data).slice(0, 200))); }
+      });
+    });
+    r.on('error', reject); r.write(body); r.end();
+  });
+}
+async function dropboxListFolder(token, path, recursive) {
+  const out = [];
+  let res = await dropboxApiCall(token, '/2/files/list_folder', { path: path || '', recursive: !!recursive, limit: 2000 });
+  (res.entries || []).forEach(e => out.push({ tag: e['.tag'], name: e.name, path: e.path_display || e.path_lower }));
+  while (res.has_more) {
+    res = await dropboxApiCall(token, '/2/files/list_folder/continue', { cursor: res.cursor });
+    (res.entries || []).forEach(e => out.push({ tag: e['.tag'], name: e.name, path: e.path_display || e.path_lower }));
+  }
+  return out;
 }
 
 function setCORS(res) {
@@ -786,6 +818,31 @@ http.createServer(async (req, res) => {
         console.error('Upload error:', e.message);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // ===== Dropbox LIST (read-only, temporary — folder-mapping pass; DELETE after) =====
+  // POST /api/dropbox-list  header X-List-Key: <DROPBOX_LIST_KEY>  body { path?, recursive? }
+  if (req.method === 'POST' && req.url === '/api/dropbox-list') {
+    const key = req.headers['x-list-key'] || '';
+    if (!DROPBOX_LIST_KEY || key !== DROPBOX_LIST_KEY) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Forbidden' }));
+    }
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', async () => {
+      try {
+        const { path, recursive } = JSON.parse(body || '{}');
+        const token = await getDropboxToken();
+        const entries = await dropboxListFolder(token, path || '', !!recursive);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ entries, count: entries.length }));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
       }
     });
     return;
