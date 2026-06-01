@@ -22,11 +22,11 @@ const DROPBOX_LIST_KEY = process.env.DROPBOX_LIST_KEY || '';
 // =================== AUTH (Step 1) ===================
 // Passwords live in Render env vars — never in code, never in browser source.
 //
-// Required env vars:
-//   TEAM_PASSWORDS    "Faizan:faizan47,Sandesh:sandesh82,..."  (Name:password, comma-separated)
-//   CLIENT_PASSWORDS  "jindal:Jindal2026,kotak:Kotak2026,adhoc:Adhoc2026,pitches:Pitches2026"
-//   MASTER_PASSWORD   "Yellow@1234"   (founder + universal client unlock)
-//   JWT_SECRET        "<random long string>"  (rotate to invalidate everyone's session)
+// Required env vars (set real values only in Render — never in this file):
+//   TEAM_PASSWORDS    "Faizan:<pw>,Sandesh:<pw>,..."   (Name:password, comma-separated)
+//   CLIENT_PASSWORDS  "jindal:<pw>,kotak:<pw>,adhoc:<pw>,pitches:<pw>"
+//   MASTER_PASSWORD   "<pw>"                            (founder + universal client unlock)
+//   JWT_SECRET        "<random long string>"            (rotate to invalidate everyone's session)
 const JWT_SECRET = process.env.JWT_SECRET || 'CHANGE_ME_IN_RENDER_ENV';
 const MASTER_PASSWORD = process.env.MASTER_PASSWORD || '';
 
@@ -38,8 +38,8 @@ function parseEnvMap(raw) {
   });
   return out;
 }
-const TEAM_PASSWORDS   = parseEnvMap(process.env.TEAM_PASSWORDS);   // {Faizan:'faizan47',...}
-const CLIENT_PASSWORDS = parseEnvMap(process.env.CLIENT_PASSWORDS); // {jindal:'Jindal2026',...}
+const TEAM_PASSWORDS   = parseEnvMap(process.env.TEAM_PASSWORDS);   // {Faizan:'<pw>',...}
+const CLIENT_PASSWORDS = parseEnvMap(process.env.CLIENT_PASSWORDS); // {jindal:'<pw>',...}
 
 const SESSION_DAYS = 7;
 
