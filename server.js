@@ -905,9 +905,19 @@ http.createServer(async (req, res) => {
 
   // ===== Dropbox CHUNKED UPLOAD (memory-safe, any file size) =====
   // POST /api/dropbox-chunk  raw body = one chunk; headers:
+  //   Authorization: Bearer <yv-auth>  (required — matches /api/db gating)
   //   X-Phase: start|append|finish, X-Session-Id, X-Offset, X-Path (finish only)
   // start → {session_id}; append → {success}; finish → {success, path, url}
   if (req.method === 'POST' && req.url === '/api/dropbox-chunk') {
+    // Auth — was previously OPEN. Anyone with the URL could push files into
+    // Dropbox. Now requires the same team token Studio already holds via the
+    // gateway shim. Verified BEFORE reading the body so a junk request closes fast.
+    const chunkTok = (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '');
+    const chunkPayload = verifyToken(chunkTok);
+    if (!chunkPayload) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: false, error: 'Not authenticated' }));
+    }
     const parts = [];
     req.on('data', d => parts.push(d));
     req.on('end', async () => {
